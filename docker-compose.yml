@@ -2,45 +2,61 @@ version: '3.8'
 
 services:
   mongodb:
-    command: mongod --auth
-    image: mongo:latest
+    image: mongo:6.0  # Spesifik versiyon kullanımı
     container_name: mongodb
     ports:
       - "27017:27017"
     volumes:
       - mongodb_data:/data/db
+      - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro  # MongoDB şema ve kullanıcı init
     environment:
       MONGO_INITDB_ROOT_USERNAME: root
       MONGO_INITDB_ROOT_PASSWORD: example
-    restart: unless-stopped
+      MONGO_INITDB_DATABASE: shipment_db  # Varsayılan DB
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')", "--quiet"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   postgres:
-    image: postgres:13
+    image: postgres:13-alpine  # Daha hafif Alpine versiyonu
     container_name: postgres
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow_db
+      POSTGRES_HOST_AUTH_METHOD: md5  # Güvenlik için
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./postgres-init.sh:/docker-entrypoint-initdb.d/init-user-db.sh
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro  # Şema ve kullanıcı init
+      - ./create_tables.sql:/docker-entrypoint-initdb.d/create_tables.sql:ro  # Tablo oluşturma
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow_db || exit 0"]
-      interval: 10s
-      timeout: 10s
-      retries: 30
-      start_period: 90s
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   airflow:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile.airflow  # Özel Dockerfile
     container_name: airflow
     depends_on:
       postgres:
@@ -50,31 +66,58 @@ services:
     environment:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow_db
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__WEBSERVER__SECRET_KEY: "supersecretkey"
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__FERNET_KEY: "46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho="
-      AIRFLOW__CORE__DONOT_PICKLE: "true"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "supersecretkey"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__LOGGING__LOGGING_LEVEL: "INFO"
+      AIRFLOW__API__AUTH_BACKEND: "airflow.api.auth.backend.basic_auth"
+      # ETL için gerekli env'ler
+      MONGO_URI: "mongodb://root:example@mongodb:27017/shipment_db?authSource=admin&authMechanism=SCRAM-SHA-256"
+      POSTGRES_URI: "postgresql://airflow:airflow@postgres:5432/airflow_db"
     volumes:
       - ./dags:/opt/airflow/dags
-      - ./scripts:/opt/airflow/scripts
+      - ./scripts:/opt/airflow/scripts 
       - ./logs:/opt/airflow/logs
-    command: >
-      bash -c "
-      echo 'PostgreSQL bekleniyor (Max 5 dakika)...';
-      timeout 300s bash -c 'until pg_isready -h postgres -p 5432 -U airflow -d airflow_db; do sleep 10; echo ''[$(date +\"%T\")] PostgreSQL hazır değil...''; done'
-      && airflow db init
-      && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com
-      && airflow scheduler & airflow webserver
-      "
+      - ./data:/opt/airflow/data  # Ek veri paylaşımı
+      - ./plugins:/opt/airflow/plugins  # Custom pluginler için
     ports:
       - "8080:8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 0"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 10
+      retries: 5
+      start_period: 60s
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"  # Artan log boyutu
+        max-file: "5"
+    command: >
+      bash -c "
+      echo '------ Initializing Airflow ------';
+      airflow db init;
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true;
+      (airflow scheduler &) && airflow webserver
+      "
 
 volumes:
   mongodb_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/mongodb  # Host makinede spesifik path
   postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/postgres  # Host makinede spesifik path
+
+networks:
+  default:
+    driver: bridge
+    name: data_engineer_network  # Özel network adı
