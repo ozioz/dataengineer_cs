@@ -1,7 +1,8 @@
 # Data Engineer Case Study  
 ## Shipment Data Pipeline with MongoDB, PostgreSQL & Airflow  
 
-![ETL Architecture](https://miro.medium.com/v2/resize:fit:1400/format:webp/1*lg2-lBxJrvz2s66CN3dTQg.png)  
+![image](https://github.com/user-attachments/assets/62ab4f07-e6ae-4414-8cb2-f59789a4e489)
+
 *End-to-End Data Pipeline Architecture*  
 
 ---
