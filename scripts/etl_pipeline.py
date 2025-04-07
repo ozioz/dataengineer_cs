@@ -116,10 +116,15 @@ def etl_process():
                 for doc in cursor:
                     try:
                         # Timezone Conversion with Validation
-                        raw_date = doc['date']
-                        if not raw_date.tzinfo:
-                            raw_date = pytz.utc.localize(raw_date)
-                        ist_date = raw_date.astimezone(ist_timezone)
+                        raw_date = doc.get('date')
+                        if raw_date:
+                            if isinstance(raw_date, str):  # String gelirse datetime'a çevir
+                                raw_date = datetime.fromisoformat(raw_date)
+                            if not raw_date.tzinfo:  # Timezone bilgisi yoksa UTC kabul et
+                                raw_date = pytz.utc.localize(raw_date)
+                            ist_date = raw_date.astimezone(ist_timezone)
+                        else:
+                            ist_date = None
                         
                         shipment_id = doc['shipment_id']
                         
@@ -141,13 +146,15 @@ def etl_process():
                         # Process Address
                         if doc.get('address'):
                             addr = doc['address']
-                            address_batch.append({
+                            address_data = {
                                 'shipment_id': shipment_id,
-                                'street': addr.get('street'),
-                                'city': addr.get('city'),
-                                'zip': addr.get('zip'),
-                                'country': addr.get('country', 'Turkey')  # Default value
-                            })
+                                'street': addr.get('street') or None,  # Boş string yerine None
+                                'city': addr.get('city') or 'UNKNOWN',  # Default değer
+                                'zip': addr.get('zip', '').strip() or None,
+                                'country': addr.get('country', 'Turkey').upper()  # Standardizasyon
+                            }
+                            if any(address_data.values()):  # En az bir alan doluysa ekle
+                                address_batch.append(address_data)
                         
                         # Execute batch inserts when threshold reached
                         if len(shipment_batch) >= batch_size:
@@ -217,49 +224,103 @@ def etl_process():
 def _execute_batch_inserts(conn, shipments, parcels, addresses, shipment_batch, parcel_batch, address_batch):
     """Helper function for batch inserts with error handling"""
     try:
-        # Upsert shipments
-        if shipment_batch:
-            stmt = insert(shipments).values(shipment_batch).on_conflict_do_update(
+        # Shipments upsert (500'erli batch)
+        for i in range(0, len(shipment_batch), 500):
+            batch = shipment_batch[i:i + 500]
+            stmt = insert(shipments).values(batch).on_conflict_do_update(
                 index_elements=['shipment_id'],
                 set_={'date': shipments.c.date}
             )
             conn.execute(stmt)
         
-        # Insert parcels
+        # Parcels bulk insert
         if parcel_batch:
-            conn.execute(parcels.insert(), parcel_batch)
+            conn.execute(
+                parcels.insert().prefix_with("ON CONFLICT DO NOTHING"),
+                parcel_batch
+            )
         
-        # Insert addresses
+        # Addresses bulk insert with conflict handling
         if address_batch:
-            conn.execute(addresses.insert(), address_batch)
+            conn.execute(
+                addresses.insert().prefix_with("ON CONFLICT (shipment_id) DO UPDATE SET "
+                "street=EXCLUDED.street, city=EXCLUDED.city, zip=EXCLUDED.zip"),
+                address_batch
+            )
             
     except SQLAlchemyError as e:
         logger.error(f"Batch insert failed: {e}")
         raise
 
 def _perform_data_validation(conn, expected_count):
-    """Data quality checks"""
+    """Enhanced data quality checks with metrics tracking"""
+    validation_metrics = {
+        'missing_shipments': 0,
+        'null_critical_fields': 0,
+        'address_integrity_issues': 0,
+        'parcel_integrity_issues': 0,
+        'timestamp_anomalies': 0
+    }
+
     try:
-        # Check counts
-        result = conn.execute(text("SELECT COUNT(*) FROM public.shipments"))
-        actual_count = result.scalar()
-        
-        if actual_count != expected_count:
-            logger.warning(f"Data count mismatch. Expected: {expected_count}, Actual: {actual_count}")
-        
-        # Check for nulls in critical fields
+        # 1. Count Validation (Shipments)
         result = conn.execute(text("""
-            SELECT COUNT(*) 
-            FROM public.shipments 
+            SELECT COUNT(*) FROM public.shipments
+        """))
+        actual_count = result.scalar()
+        validation_metrics['missing_shipments'] = max(0, expected_count - actual_count)
+
+        if actual_count != expected_count:
+            logger.warning(
+                f"Data count mismatch. Expected: {expected_count}, Actual: {actual_count} "
+                f"(Missing: {validation_metrics['missing_shipments']})"
+            )
+
+        # 2. Null Checks (Critical Fields)
+        result = conn.execute(text("""
+            SELECT COUNT(*) FROM public.shipments
             WHERE shipment_id IS NULL OR date IS NULL
         """))
-        null_count = result.scalar()
-        
-        if null_count > 0:
-            logger.warning(f"Found {null_count} records with null values in critical fields")
-            
+        validation_metrics['null_critical_fields'] = result.scalar()
+
+        # 3. Address Integrity Check
+        result = conn.execute(text("""
+            SELECT COUNT(DISTINCT s.shipment_id)
+            FROM public.shipments s
+            LEFT JOIN public.addresses a ON s.shipment_id = a.shipment_id
+            WHERE a.shipment_id IS NULL
+        """))
+        validation_metrics['address_integrity_issues'] = result.scalar()
+
+        # 4. Parcel Integrity Check
+        result = conn.execute(text("""
+            SELECT COUNT(DISTINCT p.shipment_id)
+            FROM public.parcels p
+            WHERE p.parcel_code IS NULL OR p.parcel_code = ''
+        """))
+        validation_metrics['parcel_integrity_issues'] = result.scalar()
+
+        # 5. Timestamp Anomalies (Future Dates)
+        result = conn.execute(text("""
+            SELECT COUNT(*) FROM public.shipments
+            WHERE date > NOW() + INTERVAL '1 day'
+        """))
+        validation_metrics['timestamp_anomalies'] = result.scalar()
+
+        # Log all metrics
+        logger.info("Data Quality Metrics:\n" + "\n".join(
+            f"- {k.replace('_', ' ').title()}: {v}" 
+            for k, v in validation_metrics.items()
+        ))
+
+        # Critical failure threshold
+        if validation_metrics['null_critical_fields'] > 0:
+            logger.error("CRITICAL: Null values in shipment_id/date fields")
+            # raise ValueError("Data quality check failed")  # Uncomment to fail pipeline
+
     except Exception as e:
-        logger.error(f"Data validation failed: {e}")
+        logger.error(f"Data validation failed: {str(e)}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
     etl_process()
